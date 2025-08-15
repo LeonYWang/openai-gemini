@@ -1,7 +1,29 @@
 import { Buffer } from "node:buffer";
 
+
+// === 限流新增 ===
+let lastRequestTime = 0;
+const minInterval = 500; // 每个请求至少间隔 500ms
+let queue = Promise.resolve();
+function rateLimit(fn) {
+  return (...args) => {
+    queue = queue.then(async () => {
+      const now = Date.now();
+      const diff = now - lastRequestTime;
+      if (diff < minInterval) {
+        await new Promise(r => setTimeout(r, minInterval - diff));
+      }
+      lastRequestTime = Date.now();
+      return fn(...args);
+    });
+    return queue;
+  };
+}
+// === 限流新增结束 ===
+
+
 export default {
-  async fetch (request) {
+  fetch: rateLimit(async (request) {
     if (request.method === "OPTIONS") {
       return handleOPTIONS();
     }
