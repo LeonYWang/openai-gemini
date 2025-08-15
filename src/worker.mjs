@@ -1,22 +1,126 @@
 import { Buffer } from "node:buffer";
 
+// API Key 轮换管理
+class ApiKeyManager {
+  constructor() {
+    this.keys = this.loadApiKeys();
+    this.currentIndex = 0;
+    this.keyStats = new Map(); // 统计每个key的使用情况
+  }
+
+  loadApiKeys() {
+    // 从环境变量加载多个API Key
+    const keys = [];
+    
+    // 方式1: 使用逗号分隔的单个环境变量
+    if (process.env.GEMINI_API_KEYS) {
+      keys.push(...process.env.GEMINI_API_KEYS.split(',').map(key => key.trim()));
+    }
+    
+    // 方式2: 使用编号的多个环境变量
+    let i = 1;
+    while (process.env[`GEMINI_API_KEY_${i}`]) {
+      keys.push(process.env[`GEMINI_API_KEY_${i}`].trim());
+      i++;
+    }
+    
+    // 方式3: 兼容原始单个API Key
+    if (keys.length === 0 && process.env.GEMINI_API_KEY) {
+      keys.push(process.env.GEMINI_API_KEY.trim());
+    }
+
+    console.log(`Loaded ${keys.length} API keys`);
+    return keys.filter(key => key && key.length > 0);
+  }
+
+  getNextKey() {
+    if (this.keys.length === 0) {
+      return null;
+    }
+
+    // 轮换策略：简单的循环轮换
+    const key = this.keys[this.currentIndex];
+    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
+    
+    // 记录使用统计
+    const count = this.keyStats.get(key) || 0;
+    this.keyStats.set(key, count + 1);
+    
+    return key;
+  }
+
+  // 获取最少使用的key（负载均衡策略）
+  getLeastUsedKey() {
+    if (this.keys.length === 0) {
+      return null;
+    }
+
+    let minUsage = Infinity;
+    let selectedKey = this.keys[0];
+
+    for (const key of this.keys) {
+      const usage = this.keyStats.get(key) || 0;
+      if (usage < minUsage) {
+        minUsage = usage;
+        selectedKey = key;
+      }
+    }
+
+    // 更新使用统计
+    const count = this.keyStats.get(selectedKey) || 0;
+    this.keyStats.set(selectedKey, count + 1);
+
+    return selectedKey;
+  }
+
+  // 标记某个key出错（可以实现错误重试逻辑）
+  markKeyError(key) {
+    console.warn(`API Key error: ${key.substring(0, 10)}...`);
+    // 这里可以实现更复杂的错误处理逻辑
+    // 比如临时禁用出错的key等
+  }
+
+  getStats() {
+    return {
+      totalKeys: this.keys.length,
+      usage: Object.fromEntries(this.keyStats.entries())
+    };
+  }
+}
+
+// 全局API Key管理器实例
+const apiKeyManager = new ApiKeyManager();
+
 export default {
-  async fetch (request) {
+  async fetch(request) {
     if (request.method === "OPTIONS") {
       return handleOPTIONS();
     }
+
     const errHandler = (err) => {
       console.error(err);
       return new Response(err.message, fixCors({ status: err.status ?? 500 }));
     };
+
     try {
+      // 优先使用请求头中的API Key，如果没有则使用轮换的key
       const auth = request.headers.get("Authorization");
-      const apiKey = auth?.split(" ")[1];
+      let apiKey = auth?.split(" ")[1];
+      
+      // 如果请求没有携带API Key，使用管理器提供的key
+      if (!apiKey) {
+        apiKey = apiKeyManager.getNextKey(); // 或者使用 getLeastUsedKey()
+        if (!apiKey) {
+          throw new HttpError("No API keys available", 500);
+        }
+      }
+
       const assert = (success) => {
         if (!success) {
           throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
         }
       };
+
       const { pathname } = new URL(request.url);
       switch (true) {
         case pathname.endsWith("/chat/completions"):
@@ -31,6 +135,14 @@ export default {
           assert(request.method === "GET");
           return handleModels(apiKey)
             .catch(errHandler);
+        case pathname.endsWith("/stats"):
+          // 新增：查看API Key使用统计
+          assert(request.method === "GET");
+          return new Response(JSON.stringify(apiKeyManager.getStats(), null, 2), 
+            fixCors({ 
+              status: 200,
+              headers: { "Content-Type": "application/json" }
+            }));
         default:
           throw new HttpError("404 Not Found", 404);
       }
@@ -75,7 +187,7 @@ const makeHeaders = (apiKey, more) => ({
   ...more
 });
 
-async function handleModels (apiKey) {
+async function handleModels(apiKey) {
   const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
   });
@@ -96,7 +208,7 @@ async function handleModels (apiKey) {
 }
 
 const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
-async function handleEmbeddings (req, apiKey) {
+async function handleEmbeddings(req, apiKey) {
   if (typeof req.model !== "string") {
     throw new HttpError("model is not specified", 400);
   }
@@ -110,7 +222,7 @@ async function handleEmbeddings (req, apiKey) {
     model = "models/" + req.model;
   }
   if (!Array.isArray(req.input)) {
-    req.input = [ req.input ];
+    req.input = [req.input];
   }
   const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
     method: "POST",
@@ -140,7 +252,7 @@ async function handleEmbeddings (req, apiKey) {
 }
 
 const DEFAULT_MODEL = "gemini-2.5-flash";
-async function handleCompletions (req, apiKey) {
+async function handleCompletions(req, apiKey) {
   let model = DEFAULT_MODEL;
   switch (true) {
     case typeof req.model !== "string":
@@ -172,55 +284,70 @@ async function handleCompletions (req, apiKey) {
       // eslint-disable-next-line no-fallthrough
     case req.model.endsWith("-search-preview"):
       body.tools = body.tools || [];
-      body.tools.push({googleSearch: {}});
+      body.tools.push({ googleSearch: {} });
   }
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
   if (req.stream) { url += "?alt=sse"; }
-  const response = await fetch(url, {
-    method: "POST",
-    headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-    body: JSON.stringify(body),
-  });
+  
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
 
-  body = response.body;
-  if (response.ok) {
-    let id = "chatcmpl-" + generateId(); //"chatcmpl-8pMMaqXMK68B3nyDBrapTDrhkHBQK";
-    const shared = {};
-    if (req.stream) {
-      body = response.body
-        .pipeThrough(new TextDecoderStream())
-        .pipeThrough(new TransformStream({
-          transform: parseStream,
-          flush: parseStreamFlush,
-          buffer: "",
-          shared,
-        }))
-        .pipeThrough(new TransformStream({
-          transform: toOpenAiStream,
-          flush: toOpenAiStreamFlush,
-          streamIncludeUsage: req.stream_options?.include_usage,
-          model, id, last: [],
-          shared,
-        }))
-        .pipeThrough(new TextEncoderStream());
-    } else {
-      body = await response.text();
-      try {
-        body = JSON.parse(body);
-        if (!body.candidates) {
-          throw new Error("Invalid completion object");
+    body = response.body;
+    if (response.ok) {
+      let id = "chatcmpl-" + generateId();
+      const shared = {};
+      if (req.stream) {
+        body = response.body
+          .pipeThrough(new TextDecoderStream())
+          .pipeThrough(new TransformStream({
+            transform: parseStream,
+            flush: parseStreamFlush,
+            buffer: "",
+            shared,
+          }))
+          .pipeThrough(new TransformStream({
+            transform: toOpenAiStream,
+            flush: toOpenAiStreamFlush,
+            streamIncludeUsage: req.stream_options?.include_usage,
+            model, id, last: [],
+            shared,
+          }))
+          .pipeThrough(new TextEncoderStream());
+      } else {
+        body = await response.text();
+        try {
+          body = JSON.parse(body);
+          if (!body.candidates) {
+            throw new Error("Invalid completion object");
+          }
+        } catch (err) {
+          console.error("Error parsing response:", err);
+          return new Response(body, fixCors(response));
         }
-      } catch (err) {
-        console.error("Error parsing response:", err);
-        return new Response(body, fixCors(response)); // output as is
+        body = processCompletionsResponse(body, model, id);
       }
-      body = processCompletionsResponse(body, model, id);
+    } else if (response.status === 429 || response.status === 403) {
+      // API配额限制或权限错误，标记当前key有问题
+      apiKeyManager.markKeyError(apiKey);
+      throw new HttpError(`API Error: ${response.status} ${response.statusText}`, response.status);
     }
+    
+    return new Response(body, fixCors(response));
+  } catch (error) {
+    if (error instanceof HttpError) {
+      throw error;
+    }
+    apiKeyManager.markKeyError(apiKey);
+    throw new HttpError(`Request failed: ${error.message}`, 500);
   }
-  return new Response(body, fixCors(response));
 }
 
+// 以下是原有的其他函数，保持不变...
 const adjustProps = (schemaPart) => {
   if (typeof schemaPart !== "object" || schemaPart === null) {
     return;
@@ -255,12 +382,12 @@ const fieldsMap = {
   frequency_penalty: "frequencyPenalty",
   max_completion_tokens: "maxOutputTokens",
   max_tokens: "maxOutputTokens",
-  n: "candidateCount", // not for streaming
+  n: "candidateCount",
   presence_penalty: "presencePenalty",
   seed: "seed",
   stop: "stopSequences",
   temperature: "temperature",
-  top_k: "topK", // non-standard
+  top_k: "topK",
   top_p: "topP",
 };
 const thinkingBudgetMap = {
@@ -270,7 +397,6 @@ const thinkingBudgetMap = {
 };
 const transformConfig = (req) => {
   let cfg = {};
-  //if (typeof req.stop === "string") { req.stop = [req.stop]; } // no need
   for (let key in req) {
     const matchedKey = fieldsMap[key];
     if (matchedKey) {
@@ -286,7 +412,6 @@ const transformConfig = (req) => {
           cfg.responseMimeType = "text/x.enum";
           break;
         }
-        // eslint-disable-next-line no-fallthrough
       case "json_object":
         cfg.responseMimeType = "application/json";
         break;
@@ -377,7 +502,7 @@ const transformFnCalls = ({ tool_calls }) => {
       console.error("Error parsing function arguments:", err);
       throw new HttpError("Invalid function arguments: " + argstr, 400);
     }
-    calls[id] = {i, name};
+    calls[id] = { i, name };
     return {
       functionCall: {
         id: id.startsWith("call_") ? null : id,
@@ -393,15 +518,9 @@ const transformFnCalls = ({ tool_calls }) => {
 const transformMsg = async ({ content }) => {
   const parts = [];
   if (!Array.isArray(content)) {
-    // system, user: string
-    // assistant: string or null (Required unless tool_calls is specified.)
     parts.push({ text: content });
     return parts;
   }
-  // user:
-  // An array of content parts with a defined type.
-  // Supported options differ based on the model being used to generate the response.
-  // Can contain text, image, or audio inputs.
   for (const item of content) {
     switch (item.type) {
       case "text":
@@ -423,7 +542,7 @@ const transformMsg = async ({ content }) => {
     }
   }
   if (content.every(item => item.type === "image_url")) {
-    parts.push({ text: "" }); // to avoid "Unable to submit request because it must have a text parameter"
+    parts.push({ text: "" });
   }
   return parts;
 };
@@ -438,13 +557,12 @@ const transformMessages = async (messages) => {
         system_instruction = { parts: await transformMsg(item) };
         continue;
       case "tool":
-        // eslint-disable-next-line no-case-declarations
         let { role, parts } = contents[contents.length - 1] ?? {};
         if (role !== "function") {
           const calls = parts?.calls;
           parts = []; parts.calls = calls;
           contents.push({
-            role: "function", // ignored
+            role: "function",
             parts
           });
         }
@@ -468,7 +586,6 @@ const transformMessages = async (messages) => {
       contents.unshift({ role: "user", parts: { text: " " } });
     }
   }
-  //console.info(JSON.stringify(contents, 2));
   return { system_instruction, contents };
 };
 
@@ -480,7 +597,7 @@ const transformTools = (req) => {
     tools = [{ function_declarations: funcs.map(schema => schema.function) }];
   }
   if (req.tool_choice) {
-    const allowed_function_names = req.tool_choice?.type === "function" ? [ req.tool_choice?.function?.name ] : undefined;
+    const allowed_function_names = req.tool_choice?.type === "function" ? [req.tool_choice?.function?.name] : undefined;
     if (allowed_function_names || typeof req.tool_choice === "string") {
       tool_config = {
         function_calling_config: {
@@ -506,13 +623,11 @@ const generateId = () => {
   return Array.from({ length: 29 }, randomChar).join("");
 };
 
-const reasonsMap = { //https://ai.google.dev/api/rest/v1/GenerateContentResponse#finishreason
-  //"FINISH_REASON_UNSPECIFIED": // Default value. This value is unused.
+const reasonsMap = {
   "STOP": "stop",
   "MAX_TOKENS": "length",
   "SAFETY": "content_filter",
   "RECITATION": "content_filter",
-  //"OTHER": "OTHER",
 };
 const SEP = "\n\n|>";
 const transformCandidates = (key, cand) => {
@@ -535,11 +650,10 @@ const transformCandidates = (key, cand) => {
   }
   message.content = message.content.join(SEP) || null;
   return {
-    index: cand.index || 0, // 0-index is absent in new -002 models response
+    index: cand.index || 0,
     [key]: message,
     logprobs: null,
     finish_reason: message.tool_calls ? "tool_calls" : reasonsMap[cand.finishReason] || cand.finishReason,
-    //original_finish_reason: cand.finishReason,
   };
 };
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
@@ -564,7 +678,6 @@ const checkPromptBlock = (choices, promptFeedback, key) => {
       index: 0,
       [key]: null,
       finish_reason: "content_filter",
-      //original_finish_reason: data.promptFeedback.blockReason,
     });
   }
   return true;
@@ -574,29 +687,28 @@ const processCompletionsResponse = (data, model, id) => {
   const obj = {
     id,
     choices: data.candidates.map(transformCandidatesMessage),
-    created: Math.floor(Date.now()/1000),
+    created: Math.floor(Date.now() / 1000),
     model: data.modelVersion ?? model,
-    //system_fingerprint: "fp_69829325d0",
     object: "chat.completion",
     usage: data.usageMetadata && transformUsage(data.usageMetadata),
   };
-  if (obj.choices.length === 0 ) {
+  if (obj.choices.length === 0) {
     checkPromptBlock(obj.choices, data.promptFeedback, "message");
   }
   return JSON.stringify(obj);
 };
 
 const responseLineRE = /^data: (.*)(?:\n\n|\r\r|\r\n\r\n)/;
-function parseStream (chunk, controller) {
+function parseStream(chunk, controller) {
   this.buffer += chunk;
   do {
     const match = this.buffer.match(responseLineRE);
     if (!match) { break; }
     controller.enqueue(match[1]);
     this.buffer = this.buffer.substring(match[0].length);
-  } while (true); // eslint-disable-line no-constant-condition
+  } while (true);
 }
-function parseStreamFlush (controller) {
+function parseStreamFlush(controller) {
   if (this.buffer) {
     console.error("Invalid data:", this.buffer);
     controller.enqueue(this.buffer);
@@ -606,10 +718,10 @@ function parseStreamFlush (controller) {
 
 const delimiter = "\n\n";
 const sseline = (obj) => {
-  obj.created = Math.floor(Date.now()/1000);
+  obj.created = Math.floor(Date.now() / 1000);
   return "data: " + JSON.stringify(obj) + delimiter;
 };
-function toOpenAiStream (line, controller) {
+function toOpenAiStream(line, controller) {
   let data;
   try {
     data = JSON.parse(line);
@@ -618,16 +730,14 @@ function toOpenAiStream (line, controller) {
     }
   } catch (err) {
     console.error("Error parsing response:", err);
-    if (!this.shared.is_buffers_rest) { line =+ delimiter; }
-    controller.enqueue(line); // output as is
+    if (!this.shared.is_buffers_rest) { line = +delimiter; }
+    controller.enqueue(line);
     return;
   }
   const obj = {
     id: this.id,
     choices: data.candidates.map(transformCandidatesDelta),
-    //created: Math.floor(Date.now()/1000),
     model: data.modelVersion ?? this.model,
-    //system_fingerprint: "fp_69829325d0",
     object: "chat.completion.chunk",
     usage: data.usageMetadata && this.streamIncludeUsage ? null : undefined,
   };
@@ -637,17 +747,17 @@ function toOpenAiStream (line, controller) {
   }
   console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
   const cand = obj.choices[0];
-  cand.index = cand.index || 0; // absent in new -002 models response
+  cand.index = cand.index || 0;
   const finish_reason = cand.finish_reason;
   cand.finish_reason = null;
-  if (!this.last[cand.index]) { // first
+  if (!this.last[cand.index]) {
     controller.enqueue(sseline({
       ...obj,
       choices: [{ ...cand, tool_calls: undefined, delta: { role: "assistant", content: "" } }],
     }));
   }
   delete cand.delta.role;
-  if ("content" in cand.delta) { // prevent empty data (e.g. when MAX_TOKENS)
+  if ("content" in cand.delta) {
     controller.enqueue(sseline(obj));
   }
   cand.finish_reason = finish_reason;
@@ -657,7 +767,7 @@ function toOpenAiStream (line, controller) {
   cand.delta = {};
   this.last[cand.index] = obj;
 }
-function toOpenAiStreamFlush (controller) {
+function toOpenAiStreamFlush(controller) {
   if (this.last.length > 0) {
     for (const obj of this.last) {
       controller.enqueue(sseline(obj));
