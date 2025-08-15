@@ -1,4 +1,12 @@
-import { Buffer } from "node:buffer";
+// Edge Functions 环境兼容性处理
+const Buffer = globalThis.Buffer || {
+  from: (data) => {
+    if (data instanceof ArrayBuffer) {
+      return new Uint8Array(data);
+    }
+    return new TextEncoder().encode(data);
+  }
+};
 
 // API Key 轮换管理
 class ApiKeyManager {
@@ -9,24 +17,42 @@ class ApiKeyManager {
   }
 
   loadApiKeys() {
-    // 从环境变量加载多个API Key
+    // 从环境变量加载多个API Key，兼容不同运行环境
     const keys = [];
     
+    // 获取环境变量的兼容方法
+    const getEnv = (key) => {
+      // Edge Functions (Deno) 环境
+      if (typeof Deno !== 'undefined' && Deno.env) {
+        return Deno.env.get(key);
+      }
+      // Node.js 环境
+      if (typeof process !== 'undefined' && process.env) {
+        return process.env[key];
+      }
+      return undefined;
+    };
+    
     // 方式1: 使用逗号分隔的单个环境变量
-    if (process.env.GEMINI_API_KEYS) {
-      keys.push(...process.env.GEMINI_API_KEYS.split(',').map(key => key.trim()));
+    const apiKeysEnv = getEnv('GEMINI_API_KEYS');
+    if (apiKeysEnv) {
+      keys.push(...apiKeysEnv.split(',').map(key => key.trim()));
     }
     
     // 方式2: 使用编号的多个环境变量
     let i = 1;
-    while (process.env[`GEMINI_API_KEY_${i}`]) {
-      keys.push(process.env[`GEMINI_API_KEY_${i}`].trim());
+    let currentKey;
+    while ((currentKey = getEnv(`GEMINI_API_KEY_${i}`))) {
+      keys.push(currentKey.trim());
       i++;
     }
     
     // 方式3: 兼容原始单个API Key
-    if (keys.length === 0 && process.env.GEMINI_API_KEY) {
-      keys.push(process.env.GEMINI_API_KEY.trim());
+    if (keys.length === 0) {
+      const singleKey = getEnv('GEMINI_API_KEY');
+      if (singleKey) {
+        keys.push(singleKey.trim());
+      }
     }
 
     console.log(`Loaded ${keys.length} API keys`);
