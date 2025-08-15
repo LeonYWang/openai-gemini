@@ -23,7 +23,7 @@ function rateLimit(fn) {
 
 
 export default {
-  fetch: rateLimit(async (request) {
+  fetch: rateLimit(async (request) => {
     if (request.method === "OPTIONS") {
       return handleOPTIONS();
     }
