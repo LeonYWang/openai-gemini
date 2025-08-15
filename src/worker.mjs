@@ -8,46 +8,41 @@ const Buffer = globalThis.Buffer || {
   }
 };
 
-// API Key 轮换管理
-class ApiKeyManager {
+// 增强的 API Key 管理器，包含错误处理和重试机制
+class EnhancedApiKeyManager {
   constructor() {
     this.keys = this.loadApiKeys();
     this.currentIndex = 0;
-    this.keyStats = new Map(); // 统计每个key的使用情况
+    this.keyStats = new Map();
+    this.errorCounts = new Map();
+    this.blacklistedKeys = new Set(); // 临时黑名单
+    this.blacklistTimeout = 5 * 60 * 1000; // 5分钟后重新启用
   }
 
   loadApiKeys() {
-    // 从环境变量加载多个API Key，兼容不同运行环境
     const keys = [];
-    
-    // 获取环境变量的兼容方法
     const getEnv = (key) => {
-      // Edge Functions (Deno) 环境
       if (typeof Deno !== 'undefined' && Deno.env) {
         return Deno.env.get(key);
       }
-      // Node.js 环境
       if (typeof process !== 'undefined' && process.env) {
         return process.env[key];
       }
       return undefined;
     };
-    
-    // 方式1: 使用逗号分隔的单个环境变量
+
     const apiKeysEnv = getEnv('GEMINI_API_KEYS');
     if (apiKeysEnv) {
       keys.push(...apiKeysEnv.split(',').map(key => key.trim()));
     }
-    
-    // 方式2: 使用编号的多个环境变量
+
     let i = 1;
     let currentKey;
     while ((currentKey = getEnv(`GEMINI_API_KEY_${i}`))) {
       keys.push(currentKey.trim());
       i++;
     }
-    
-    // 方式3: 兼容原始单个API Key
+
     if (keys.length === 0) {
       const singleKey = getEnv('GEMINI_API_KEY');
       if (singleKey) {
@@ -59,32 +54,41 @@ class ApiKeyManager {
     return keys.filter(key => key && key.length > 0);
   }
 
+  getAvailableKeys() {
+    return this.keys.filter(key => !this.blacklistedKeys.has(key));
+  }
+
   getNextKey() {
-    if (this.keys.length === 0) {
-      return null;
+    const availableKeys = this.getAvailableKeys();
+    if (availableKeys.length === 0) {
+      // 如果所有key都被黑名单了，清空黑名单重新开始
+      console.warn('All keys blacklisted, clearing blacklist');
+      this.blacklistedKeys.clear();
+      return this.keys.length > 0 ? this.keys[0] : null;
     }
 
-    // 轮换策略：简单的循环轮换
-    const key = this.keys[this.currentIndex];
-    this.currentIndex = (this.currentIndex + 1) % this.keys.length;
-    
-    // 记录使用统计
+    // 在可用key中轮换
+    const keyIndex = this.currentIndex % availableKeys.length;
+    const key = availableKeys[keyIndex];
+    this.currentIndex = (this.currentIndex + 1) % availableKeys.length;
+
     const count = this.keyStats.get(key) || 0;
     this.keyStats.set(key, count + 1);
-    
+
     return key;
   }
 
-  // 获取最少使用的key（负载均衡策略）
   getLeastUsedKey() {
-    if (this.keys.length === 0) {
-      return null;
+    const availableKeys = this.getAvailableKeys();
+    if (availableKeys.length === 0) {
+      this.blacklistedKeys.clear();
+      return this.keys.length > 0 ? this.keys[0] : null;
     }
 
     let minUsage = Infinity;
-    let selectedKey = this.keys[0];
+    let selectedKey = availableKeys[0];
 
-    for (const key of this.keys) {
+    for (const key of availableKeys) {
       const usage = this.keyStats.get(key) || 0;
       if (usage < minUsage) {
         minUsage = usage;
@@ -92,30 +96,157 @@ class ApiKeyManager {
       }
     }
 
-    // 更新使用统计
     const count = this.keyStats.get(selectedKey) || 0;
     this.keyStats.set(selectedKey, count + 1);
 
     return selectedKey;
   }
 
-  // 标记某个key出错（可以实现错误重试逻辑）
-  markKeyError(key) {
-    console.warn(`API Key error: ${key.substring(0, 10)}...`);
-    // 这里可以实现更复杂的错误处理逻辑
-    // 比如临时禁用出错的key等
+  markKeyError(key, errorType) {
+    const errorCount = this.errorCounts.get(key) || 0;
+    this.errorCounts.set(key, errorCount + 1);
+
+    console.warn(`API Key error: ${key.substring(0, 10)}... Error type: ${errorType}, Count: ${errorCount + 1}`);
+
+    // 根据错误类型决定是否加入黑名单
+    if (this.shouldBlacklistKey(errorType, errorCount + 1)) {
+      this.blacklistKey(key);
+    }
+  }
+
+  shouldBlacklistKey(errorType, errorCount) {
+    // 立即黑名单的错误类型
+    const immediateBlacklist = ['invalid_api_key', 'permission_denied', 'quota_exceeded_daily'];
+    if (immediateBlacklist.includes(errorType)) {
+      return true;
+    }
+
+    // 连续错误达到阈值
+    const errorThreshold = {
+      'rate_limit_exceeded': 3,  // 429错误
+      'server_error': 5,         // 500错误
+      'service_unavailable': 3,  // 503错误
+      'timeout': 5,              // 超时错误
+      'default': 10              // 其他错误
+    };
+
+    const threshold = errorThreshold[errorType] || errorThreshold['default'];
+    return errorCount >= threshold;
+  }
+
+  blacklistKey(key) {
+    this.blacklistedKeys.add(key);
+    console.warn(`Key ${key.substring(0, 10)}... added to blacklist`);
+
+    // 设置定时器，一段时间后从黑名单移除
+    setTimeout(() => {
+      this.blacklistedKeys.delete(key);
+      console.log(`Key ${key.substring(0, 10)}... removed from blacklist`);
+    }, this.blacklistTimeout);
   }
 
   getStats() {
     return {
       totalKeys: this.keys.length,
-      usage: Object.fromEntries(this.keyStats.entries())
+      availableKeys: this.getAvailableKeys().length,
+      blacklistedKeys: this.blacklistedKeys.size,
+      usage: Object.fromEntries(this.keyStats.entries()),
+      errors: Object.fromEntries(this.errorCounts.entries()),
+      blacklist: Array.from(this.blacklistedKeys).map(key => key.substring(0, 10) + '...')
     };
   }
 }
 
-// 全局API Key管理器实例
-const apiKeyManager = new ApiKeyManager();
+// 错误类型识别器
+class ErrorAnalyzer {
+  static analyzeError(response, error) {
+    if (response) {
+      switch (response.status) {
+        case 400:
+          return 'bad_request';
+        case 401:
+          return 'invalid_api_key';
+        case 403:
+          return 'permission_denied';
+        case 429:
+          return 'rate_limit_exceeded';
+        case 500:
+          return 'server_error';
+        case 503:
+          return 'service_unavailable';
+        case 504:
+          return 'timeout';
+        default:
+          return 'http_error';
+      }
+    }
+
+    if (error) {
+      if (error.message.includes('quota') || error.message.includes('QUOTA')) {
+        return 'quota_exceeded_daily';
+      }
+      if (error.message.includes('timeout') || error.message.includes('TIMEOUT')) {
+        return 'timeout';
+      }
+      if (error.message.includes('network') || error.message.includes('fetch')) {
+        return 'network_error';
+      }
+    }
+
+    return 'unknown_error';
+  }
+}
+
+// 重试机制
+class RetryHandler {
+  static async executeWithRetry(fn, maxRetries = 3, delay = 1000) {
+    let lastError;
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await fn(attempt);
+      } catch (error) {
+        lastError = error;
+        
+        // 如果是不应该重试的错误，直接抛出
+        if (!RetryHandler.shouldRetry(error)) {
+          throw error;
+        }
+        
+        // 最后一次尝试失败，抛出错误
+        if (attempt === maxRetries - 1) {
+          throw error;
+        }
+        
+        // 指数退避延迟
+        const retryDelay = delay * Math.pow(2, attempt);
+        console.log(`Retry attempt ${attempt + 1}/${maxRetries} after ${retryDelay}ms`);
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+      }
+    }
+    
+    throw lastError;
+  }
+
+  static shouldRetry(error) {
+    // HTTP错误码判断
+    if (error.status) {
+      const retryableStatusCodes = [429, 500, 502, 503, 504];
+      return retryableStatusCodes.includes(error.status);
+    }
+    
+    // 网络错误
+    if (error.message) {
+      const retryableMessages = ['timeout', 'network', 'fetch failed', 'connection'];
+      return retryableMessages.some(msg => error.message.toLowerCase().includes(msg));
+    }
+    
+    return false;
+  }
+}
+
+// 全局管理器实例
+const apiKeyManager = new EnhancedApiKeyManager();
 
 export default {
   async fetch(request) {
@@ -129,13 +260,11 @@ export default {
     };
 
     try {
-      // 优先使用请求头中的API Key，如果没有则使用轮换的key
       const auth = request.headers.get("Authorization");
       let apiKey = auth?.split(" ")[1];
-      
-      // 如果请求没有携带API Key，使用管理器提供的key
+
       if (!apiKey) {
-        apiKey = apiKeyManager.getNextKey(); // 或者使用 getLeastUsedKey()
+        apiKey = apiKeyManager.getNextKey();
         if (!apiKey) {
           throw new HttpError("No API keys available", 500);
         }
@@ -162,13 +291,26 @@ export default {
           return handleModels(apiKey)
             .catch(errHandler);
         case pathname.endsWith("/stats"):
-          // 新增：查看API Key使用统计
           assert(request.method === "GET");
           return new Response(JSON.stringify(apiKeyManager.getStats(), null, 2), 
             fixCors({ 
               status: 200,
               headers: { "Content-Type": "application/json" }
             }));
+        case pathname.endsWith("/health"):
+          // 健康检查接口
+          assert(request.method === "GET");
+          const stats = apiKeyManager.getStats();
+          const isHealthy = stats.availableKeys > 0;
+          return new Response(JSON.stringify({
+            status: isHealthy ? 'healthy' : 'unhealthy',
+            availableKeys: stats.availableKeys,
+            totalKeys: stats.totalKeys,
+            timestamp: new Date().toISOString()
+          }, null, 2), fixCors({ 
+            status: isHealthy ? 200 : 503,
+            headers: { "Content-Type": "application/json" }
+          }));
         default:
           throw new HttpError("404 Not Found", 404);
       }
@@ -204,15 +346,120 @@ const handleOPTIONS = async () => {
 
 const BASE_URL = "https://generativelanguage.googleapis.com";
 const API_VERSION = "v1beta";
+const API_CLIENT = "genai-js/0.21.0";
 
-// https://github.com/google-gemini/generative-ai-js/blob/cf223ff4a1ee5a2d944c53cddb8976136382bee6/src/requests/request.ts#L71
-const API_CLIENT = "genai-js/0.21.0"; // npm view @google/generative-ai version
 const makeHeaders = (apiKey, more) => ({
   "x-goog-api-client": API_CLIENT,
   ...(apiKey && { "x-goog-api-key": apiKey }),
   ...more
 });
 
+// 增强的请求处理函数
+async function handleCompletions(req, initialApiKey) {
+  const processRequest = async (attemptNumber) => {
+    // 每次重试时可能使用不同的 key
+    const apiKey = attemptNumber > 0 ? apiKeyManager.getNextKey() : initialApiKey;
+    
+    if (!apiKey) {
+      throw new HttpError("No available API keys", 503);
+    }
+
+    let model = DEFAULT_MODEL;
+    switch (true) {
+      case typeof req.model !== "string":
+        break;
+      case req.model.startsWith("models/"):
+        model = req.model.substring(7);
+        break;
+      case req.model.startsWith("gemini-"):
+      case req.model.startsWith("gemma-"):
+      case req.model.startsWith("learnlm-"):
+        model = req.model;
+    }
+
+    let body = await transformRequest(req);
+    const extra = req.extra_body?.google;
+    if (extra) {
+      if (extra.safety_settings) {
+        body.safetySettings = extra.safety_settings;
+      }
+      if (extra.cached_content) {
+        body.cachedContent = extra.cached_content;
+      }
+      if (extra.thinking_config) {
+        body.generationConfig.thinkingConfig = extra.thinking_config;
+      }
+    }
+
+    switch (true) {
+      case model.endsWith(":search"):
+        model = model.substring(0, model.length - 7);
+      case req.model.endsWith("-search-preview"):
+        body.tools = body.tools || [];
+        body.tools.push({ googleSearch: {} });
+    }
+
+    const TASK = req.stream ? "streamGenerateContent" : "generateContent";
+    let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+    if (req.stream) { url += "?alt=sse"; }
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errorType = ErrorAnalyzer.analyzeError(response);
+      apiKeyManager.markKeyError(apiKey, errorType);
+      
+      const errorText = await response.text().catch(() => 'Unknown error');
+      throw new HttpError(`API Error: ${response.status} ${response.statusText} - ${errorText}`, response.status);
+    }
+
+    body = response.body;
+    let id = "chatcmpl-" + generateId();
+    const shared = {};
+    
+    if (req.stream) {
+      body = response.body
+        .pipeThrough(new TextDecoderStream())
+        .pipeThrough(new TransformStream({
+          transform: parseStream,
+          flush: parseStreamFlush,
+          buffer: "",
+          shared,
+        }))
+        .pipeThrough(new TransformStream({
+          transform: toOpenAiStream,
+          flush: toOpenAiStreamFlush,
+          streamIncludeUsage: req.stream_options?.include_usage,
+          model, id, last: [],
+          shared,
+        }))
+        .pipeThrough(new TextEncoderStream());
+    } else {
+      body = await response.text();
+      try {
+        body = JSON.parse(body);
+        if (!body.candidates) {
+          throw new Error("Invalid completion object");
+        }
+      } catch (err) {
+        console.error("Error parsing response:", err);
+        return new Response(body, fixCors(response));
+      }
+      body = processCompletionsResponse(body, model, id);
+    }
+
+    return new Response(body, fixCors(response));
+  };
+
+  // 使用重试机制
+  return RetryHandler.executeWithRetry(processRequest);
+}
+
+// 其他处理函数保持不变
 async function handleModels(apiKey) {
   const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
@@ -277,103 +524,9 @@ async function handleEmbeddings(req, apiKey) {
   return new Response(body, fixCors(response));
 }
 
+// 以下保持原有的辅助函数不变...
 const DEFAULT_MODEL = "gemini-2.5-flash";
-async function handleCompletions(req, apiKey) {
-  let model = DEFAULT_MODEL;
-  switch (true) {
-    case typeof req.model !== "string":
-      break;
-    case req.model.startsWith("models/"):
-      model = req.model.substring(7);
-      break;
-    case req.model.startsWith("gemini-"):
-    case req.model.startsWith("gemma-"):
-    case req.model.startsWith("learnlm-"):
-      model = req.model;
-  }
-  let body = await transformRequest(req);
-  const extra = req.extra_body?.google
-  if (extra) {
-    if (extra.safety_settings) {
-      body.safetySettings = extra.safety_settings;
-    }
-    if (extra.cached_content) {
-      body.cachedContent = extra.cached_content;
-    }
-    if (extra.thinking_config) {
-      body.generationConfig.thinkingConfig = extra.thinking_config;
-    }
-  }
-  switch (true) {
-    case model.endsWith(":search"):
-      model = model.substring(0, model.length - 7);
-      // eslint-disable-next-line no-fallthrough
-    case req.model.endsWith("-search-preview"):
-      body.tools = body.tools || [];
-      body.tools.push({ googleSearch: {} });
-  }
-  const TASK = req.stream ? "streamGenerateContent" : "generateContent";
-  let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-  if (req.stream) { url += "?alt=sse"; }
-  
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
-      body: JSON.stringify(body),
-    });
 
-    body = response.body;
-    if (response.ok) {
-      let id = "chatcmpl-" + generateId();
-      const shared = {};
-      if (req.stream) {
-        body = response.body
-          .pipeThrough(new TextDecoderStream())
-          .pipeThrough(new TransformStream({
-            transform: parseStream,
-            flush: parseStreamFlush,
-            buffer: "",
-            shared,
-          }))
-          .pipeThrough(new TransformStream({
-            transform: toOpenAiStream,
-            flush: toOpenAiStreamFlush,
-            streamIncludeUsage: req.stream_options?.include_usage,
-            model, id, last: [],
-            shared,
-          }))
-          .pipeThrough(new TextEncoderStream());
-      } else {
-        body = await response.text();
-        try {
-          body = JSON.parse(body);
-          if (!body.candidates) {
-            throw new Error("Invalid completion object");
-          }
-        } catch (err) {
-          console.error("Error parsing response:", err);
-          return new Response(body, fixCors(response));
-        }
-        body = processCompletionsResponse(body, model, id);
-      }
-    } else if (response.status === 429 || response.status === 403) {
-      // API配额限制或权限错误，标记当前key有问题
-      apiKeyManager.markKeyError(apiKey);
-      throw new HttpError(`API Error: ${response.status} ${response.statusText}`, response.status);
-    }
-    
-    return new Response(body, fixCors(response));
-  } catch (error) {
-    if (error instanceof HttpError) {
-      throw error;
-    }
-    apiKeyManager.markKeyError(apiKey);
-    throw new HttpError(`Request failed: ${error.message}`, 500);
-  }
-}
-
-// 以下是原有的其他函数，保持不变...
 const adjustProps = (schemaPart) => {
   if (typeof schemaPart !== "object" || schemaPart === null) {
     return;
@@ -387,6 +540,7 @@ const adjustProps = (schemaPart) => {
     Object.values(schemaPart).forEach(adjustProps);
   }
 };
+
 const adjustSchema = (schema) => {
   const obj = schema[schema.type];
   delete obj.strict;
@@ -404,6 +558,7 @@ const safetySettings = harmCategory.map(category => ({
   category,
   threshold: "BLOCK_NONE",
 }));
+
 const fieldsMap = {
   frequency_penalty: "frequencyPenalty",
   max_completion_tokens: "maxOutputTokens",
@@ -416,11 +571,13 @@ const fieldsMap = {
   top_k: "topK",
   top_p: "topP",
 };
+
 const thinkingBudgetMap = {
   low: 1024,
   medium: 8192,
   high: 24576,
 };
+
 const transformConfig = (req) => {
   let cfg = {};
   for (let key in req) {
@@ -655,6 +812,7 @@ const reasonsMap = {
   "SAFETY": "content_filter",
   "RECITATION": "content_filter",
 };
+
 const SEP = "\n\n|>";
 const transformCandidates = (key, cand) => {
   const message = { role: "assistant", content: [] };
@@ -682,6 +840,7 @@ const transformCandidates = (key, cand) => {
     finish_reason: message.tool_calls ? "tool_calls" : reasonsMap[cand.finishReason] || cand.finishReason,
   };
 };
+
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
@@ -734,6 +893,7 @@ function parseStream(chunk, controller) {
     this.buffer = this.buffer.substring(match[0].length);
   } while (true);
 }
+
 function parseStreamFlush(controller) {
   if (this.buffer) {
     console.error("Invalid data:", this.buffer);
@@ -747,6 +907,7 @@ const sseline = (obj) => {
   obj.created = Math.floor(Date.now() / 1000);
   return "data: " + JSON.stringify(obj) + delimiter;
 };
+
 function toOpenAiStream(line, controller) {
   let data;
   try {
@@ -756,10 +917,11 @@ function toOpenAiStream(line, controller) {
     }
   } catch (err) {
     console.error("Error parsing response:", err);
-    if (!this.shared.is_buffers_rest) { line = +delimiter; }
+    if (!this.shared.is_buffers_rest) { line += delimiter; }
     controller.enqueue(line);
     return;
   }
+  
   const obj = {
     id: this.id,
     choices: data.candidates.map(transformCandidatesDelta),
@@ -767,25 +929,30 @@ function toOpenAiStream(line, controller) {
     object: "chat.completion.chunk",
     usage: data.usageMetadata && this.streamIncludeUsage ? null : undefined,
   };
+  
   if (checkPromptBlock(obj.choices, data.promptFeedback, "delta")) {
     controller.enqueue(sseline(obj));
     return;
   }
+  
   console.assert(data.candidates.length === 1, "Unexpected candidates count: %d", data.candidates.length);
   const cand = obj.choices[0];
   cand.index = cand.index || 0;
   const finish_reason = cand.finish_reason;
   cand.finish_reason = null;
+  
   if (!this.last[cand.index]) {
     controller.enqueue(sseline({
       ...obj,
       choices: [{ ...cand, tool_calls: undefined, delta: { role: "assistant", content: "" } }],
     }));
   }
+  
   delete cand.delta.role;
   if ("content" in cand.delta) {
     controller.enqueue(sseline(obj));
   }
+  
   cand.finish_reason = finish_reason;
   if (data.usageMetadata && this.streamIncludeUsage) {
     obj.usage = transformUsage(data.usageMetadata);
@@ -793,6 +960,7 @@ function toOpenAiStream(line, controller) {
   cand.delta = {};
   this.last[cand.index] = obj;
 }
+
 function toOpenAiStreamFlush(controller) {
   if (this.last.length > 0) {
     for (const obj of this.last) {
