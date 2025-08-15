@@ -752,7 +752,8 @@ const transformMessages = async (messages) => {
         transformFnResponse(item, parts);
         continue;
       case "assistant":
-        item.role = "model";
+        // 注意：这里不要修改原始对象的role，因为后面还会用到
+        // item.role = "model"; // 删除这行，避免修改原始数据
         break;
       case "user":
         break;
@@ -760,7 +761,7 @@ const transformMessages = async (messages) => {
         throw new HttpError(`Unknown message role: "${item.role}"`, 400);
     }
     contents.push({
-      role: item.role,
+      role: item.role === "assistant" ? "model" : item.role, // 在这里做转换
       parts: item.tool_calls ? transformFnCalls(item) : await transformMsg(item)
     });
   }
